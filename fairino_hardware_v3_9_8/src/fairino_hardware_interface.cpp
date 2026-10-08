@@ -7,7 +7,25 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardw
         return hardware_interface::CallbackReturn::ERROR;
     }
     info_ = sysinfo;//info_是父类中定义的变量
-    
+
+    //从ros2_control描述的<hardware><param name="robot_ip">中读取控制器ip,未设置时保留默认值
+    auto ip_param = info_.hardware_parameters.find("robot_ip");
+    if(ip_param != info_.hardware_parameters.end() && !ip_param->second.empty()){
+        _controller_ip = ip_param->second;
+    }
+    auto comm_param = info_.hardware_parameters.find("servo_comm_type");
+    if(comm_param != info_.hardware_parameters.end() && !comm_param->second.empty()){
+        try{ _servo_comm_type = std::stoi(comm_param->second); }
+        catch(const std::exception&){
+            RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+                "servo_comm_type '%s' is not an integer, keeping %d",
+                comm_param->second.c_str(), _servo_comm_type);
+        }
+    }
+    RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
+                "Controller IP: %s (servo transport: %s)", _controller_ip.c_str(),
+                _servo_comm_type == 1 ? "UDP :20007" : "xmlrpc");
+
     for (const hardware_interface::ComponentInfo& joint : info_.joints) {
 
         //指令部分
@@ -138,6 +156,28 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
         }
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),"初始指令位置: %f,%f,%f,%f,%f,%f",_jnt_position_command[0],\
         _jnt_position_command[1],_jnt_position_command[2],_jnt_position_command[3],_jnt_position_command[4],_jnt_position_command[5]);    
+        /*
+        进入伺服模式。ServoJ 必须由 ServoMoveStart()/ServoMoveEnd() 包裹
+        (见厂商示例 fairino-python-sdk linux/example NewTest0609.py TestServoJ)。
+        缺少这一步时每个 ServoJ 都会被拒绝并返回错误码 14 —— 这不是故障,
+        机器人本身是使能且无报警的。
+        Enter servo mode. ServoJ must be bracketed by ServoMoveStart()/ServoMoveEnd();
+        without it every ServoJ is rejected with error 14 even though the robot is
+        enabled and fault-free.
+        */
+        _servo_mode_ok = (_ptr_robot->ServoMoveStart(_servo_comm_type) == 0);
+        if(_servo_mode_ok){
+            RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
+                "伺服模式已开启 (ServoMoveStart) / servo mode entered");
+        }else{
+            RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+                "ServoMoveStart 被拒绝 —— 关节状态仍可读取, 但不会下发 ServoJ。"
+                "常见原因: 机器人处于手动模式(需自动模式 Mode(0)), 或存在未清除的报警。"
+                " ServoMoveStart refused: joint states still readable, but no ServoJ will be"
+                " sent. Usual causes: robot in MANUAL mode (needs AUTOMATIC), or an"
+                " uncleared fault. Will retry once per second -- flip the pendant to"
+                " AUTOMATIC and it recovers without relaunching.");
+        }
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "机械臂硬件启动成功!");
         return hardware_interface::CallbackReturn::SUCCESS;
     }else{
@@ -151,6 +191,7 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& previous_state)
 {
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Stopping ...please wait...");
+    if(_servo_mode_ok){ _ptr_robot->ServoMoveEnd(_servo_comm_type); }//与 on_activate 的 ServoMoveStart 配对
     _ptr_robot->StopMotion();//停止机器人
     _ptr_robot->CloseRPC();//销毁实例，连接断开
     _ptr_robot.release();
@@ -186,6 +227,20 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
             [](double c) { return not std::isfinite(c); })) {
             return hardware_interface::return_type::ERROR;
         }
+        if(!_servo_mode_ok){
+            // Retry at 1 Hz so switching the pendant to AUTOMATIC recovers in place.
+            if((time - _last_servo_retry).seconds() >= 1.0){
+                _last_servo_retry = time;
+                _servo_mode_ok = (_ptr_robot->ServoMoveStart(_servo_comm_type) == 0);
+                if(_servo_mode_ok){
+                    RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
+                        "伺服模式已恢复 / servo mode recovered -- ServoJ resuming");
+                }
+            }
+            if(!_servo_mode_ok){
+                return hardware_interface::return_type::OK;  // read-only, no command
+            }
+        }
         JointPos cmd;
         ExaxisPos extcmd{0,0,0,0};
         for(auto j=0;j<6;j++){
@@ -193,9 +248,20 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
         }
         //RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ下发位置:%f,%f,%f,%f,%f,%f",\
             cmd.jPos[0],cmd.jPos[1],cmd.jPos[2],cmd.jPos[3],cmd.jPos[4],cmd.jPos[5]);
-        int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,0.008,0,0);
+        /*
+        cmdT 必须是真实的下发周期(见 robot.h): 用 controller_manager 实际的
+        period, 而不是写死 0.008 —— 否则控制器按错误的时基插值。
+        cmdT must be the real command period (robot.h), so take the controller
+        manager's actual period rather than a hardcoded 0.008.
+        */
+        float cmdT = static_cast<float>(period.seconds());
+        if(!(cmdT > 0.0005f && cmdT < 0.05f)){ cmdT = 0.008f; }
+        int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,cmdT,0,0,0,_servo_comm_type);
         if(returncode != 0){
-            RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ指令下发错误,错误码:%d",returncode);
+            static rclcpp::Clock throttle_clock(RCL_STEADY_TIME);
+            RCLCPP_ERROR_THROTTLE(rclcpp::get_logger("FairinoHardwareInterface"),
+                throttle_clock, 1000, "ServoJ指令下发错误,错误码:%d", returncode);
+            _servo_mode_ok = false;  // fall back to the retry path above
         }
     }else if(_control_mode == 1){//扭矩控制模式
         if (std::any_of(&_jnt_torque_command[0], &_jnt_torque_command[5],\
